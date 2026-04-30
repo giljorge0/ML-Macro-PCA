@@ -1,0 +1,18 @@
+# R session files
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# Generated output files (plots, etc.)
+*.pdf
+*.png
+
+# Data (add back manually if small enough)
+data/*.csv
+data/*.RData
+data/*.rds
+
+# OS files
+.DS_Store
+Thumbs.db
