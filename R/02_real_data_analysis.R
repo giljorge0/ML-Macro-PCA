@@ -1,226 +1,431 @@
 # =============================================================================
 # 02_real_data_analysis.R
 #
-# Application of Classical PCA vs MacroPCA to a real dataset.
+# Replication of Section 3 (and partially Section 4) of:
+#   Hubert et al. (2019) MacroPCA, Technometrics 61, 459-473.
 #
-# Dataset used: DPOSS (Digitized Palomar Sky Survey) -- included in cellWise
-#   - 6215 observations, 10 photometric variables
-#   - Known to contain casewise and cellwise outliers
-#   - Used as the main illustration in the MacroPCA paper (Section 5)
+# Dataset: Top Gear cars (297 cars x 11 continuous variables)
+#          from package robustHD (Alfons 2016)
 #
-# Tasks:
-#   1. Explore and preprocess the data
-#   2. Apply Classical PCA
-#   3. Apply MacroPCA
-#   4. Compare: score plots, residual plots, outlier maps, diagnostic summaries
+# Reproduces:
+#   Figure 3 – Residual maps: ICPCA (left) vs MacroPCA (right)
+#   Figure 4 – Outlier maps:  ICPCA (left) vs MacroPCA (right)
+#   Figure 5 – Online prediction: including vs excluding 24 selected cars
+#
+# Comparison: ICPCA (classical, handles NAs) vs MacroPCA (robust)
+# Components: k = 2  (as in paper)
 # =============================================================================
 
-library(cellWise)
+library(cellWise)    # MacroPCA, ICPCA, cellMap
+library(robustHD)    # topgear dataset
 library(ggplot2)
+library(ggrepel)     # non-overlapping labels on outlier map
 library(dplyr)
 library(gridExtra)
 
 # =============================================================================
-# 1. Load and inspect the DPOSS dataset
+# 1. Load Top Gear data
 # =============================================================================
-data("dposs", package = "cellWise")
-X_raw <- dposs
+data("topgear", package = "robustHD")
 
-cat("=== DPOSS Dataset ===\n")
-cat("Dimensions:", nrow(X_raw), "x", ncol(X_raw), "\n")
-cat("Variables: ", paste(colnames(X_raw), collapse = ", "), "\n\n")
-cat("Missing values per variable:\n")
-print(colSums(is.na(X_raw)))
-cat("\nBasic summary:\n")
-print(summary(X_raw))
+cat("=== Top Gear Dataset ===\n")
+cat("Dimensions:", nrow(topgear), "rows x", ncol(topgear), "cols\n")
+cat("Variables:", paste(colnames(topgear), collapse = ", "), "\n\n")
 
-# =============================================================================
-# 2. Pre-process: standardise columns (MacroPCA expects roughly standardised data)
-# =============================================================================
-X_scaled <- scale(X_raw)   # mean 0, sd 1 for each variable
+# Extract car names (row names) and numeric columns
+car_names <- rownames(topgear)
 
-# =============================================================================
-# 3. Classical PCA
-# =============================================================================
-k <- 3   # number of components (as in the paper)
+# Keep only the 11 continuous variables used in the paper
+cont_vars <- c("Price", "Displacement", "BHP", "Torque",
+               "Acceleration", "TopSpeed", "MPG",
+               "Weight", "Length", "Width", "Height")
 
-pca_classic <- prcomp(X_scaled, center = FALSE, scale. = FALSE)
+# Verify all variables exist (column names may differ slightly by package version)
+available <- intersect(cont_vars, colnames(topgear))
+missing_v <- setdiff(cont_vars, colnames(topgear))
+if (length(missing_v) > 0) {
+  cat("NOTE: Variables not found (check column names):", missing_v, "\n")
+  cat("Available columns:", paste(colnames(topgear), collapse = ", "), "\n")
+}
 
-# Proportion of variance explained
-pve <- pca_classic$sdev^2 / sum(pca_classic$sdev^2)
-cat("\n=== Classical PCA: Proportion of Variance Explained ===\n")
-print(round(cumsum(pve)[1:k], 4))
-
-# Score plot (PC1 vs PC2)
-scores_classic <- as.data.frame(pca_classic$x[, 1:2])
-colnames(scores_classic) <- c("PC1", "PC2")
-
-p_classic_scores <- ggplot(scores_classic, aes(x = PC1, y = PC2)) +
-  geom_point(alpha = 0.3, size = 0.8, colour = "#E07B54") +
-  labs(title = "Classical PCA – Score plot (PC1 vs PC2)",
-       x = "PC 1", y = "PC 2") +
-  theme_bw(base_size = 12)
-
-print(p_classic_scores)
-ggsave("pca_classic_scores.pdf", p_classic_scores, width = 6, height = 5)
-
-# Loadings heatmap
-loadings_df <- as.data.frame(pca_classic$rotation[, 1:k])
-loadings_df$variable <- rownames(loadings_df)
-loadings_long <- tidyr::pivot_longer(loadings_df, -variable,
-                                     names_to = "PC", values_to = "loading")
-
-p_loadings <- ggplot(loadings_long, aes(x = PC, y = variable, fill = loading)) +
-  geom_tile(colour = "white") +
-  scale_fill_gradient2(low = "#D7191C", mid = "white", high = "#2C7BB6",
-                       midpoint = 0, name = "Loading") +
-  labs(title = "Classical PCA – Loadings heatmap",
-       x = "Component", y = "Variable") +
-  theme_bw(base_size = 12)
-
-ggsave("pca_classic_loadings.pdf", p_loadings, width = 5, height = 5)
+X_raw <- as.matrix(topgear[, available])
+cat("Using", ncol(X_raw), "variables for", nrow(X_raw), "cars.\n")
+cat("Missing cells in raw data:", sum(is.na(X_raw)),
+    sprintf("(%.1f%%)\n\n", 100 * mean(is.na(X_raw))))
 
 # =============================================================================
-# 4. MacroPCA
+# 2. Log-transform skewed variables  (paper Section 3)
+# Five variables are right-skewed and log-transformed:
+#   Price, Displacement, BHP, Torque, TopSpeed
 # =============================================================================
-cat("\n=== Running MacroPCA (k =", k, ") ===\n")
-macro_fit <- MacroPCA(X_scaled, k = k, DDCpars = list(silent = FALSE))
+log_vars <- intersect(c("Price", "Displacement", "BHP", "Torque", "TopSpeed"),
+                      colnames(X_raw))
 
-cat("\nMacroPCA summary:\n")
-# Number of outlying cells and rows detected
-cat("Outlying cells flagged (DDC step):",
-    sum(macro_fit$indcells != 0, na.rm = TRUE), "\n")
-cat("Casewise outliers flagged:         ",
-    length(macro_fit$casewiseOutliers), "\n")
+X <- X_raw
+for (v in log_vars) {
+  X[, v] <- log(X_raw[, v])
+}
 
-# Proportion of variance explained by MacroPCA components
-pve_macro <- macro_fit$eigenvalues / sum(macro_fit$eigenvalues)
-cat("Cumulative variance explained:     ",
-    round(cumsum(pve_macro)[1:k], 4), "\n")
+cat("Log-transformed:", paste(log_vars, collapse = ", "), "\n\n")
 
-# --- Score plot ---
-scores_macro <- as.data.frame(macro_fit$scores[, 1:2])
-colnames(scores_macro) <- c("PC1", "PC2")
-scores_macro$outlier <- FALSE
-scores_macro$outlier[macro_fit$casewiseOutliers] <- TRUE
+# =============================================================================
+# 3. Fit ICPCA  (classical iterative PCA that handles NAs)
+# =============================================================================
+k <- 2    # number of components (paper uses k=2 for Top Gear)
 
-p_macro_scores <- ggplot(scores_macro, aes(x = PC1, y = PC2, colour = outlier)) +
-  geom_point(alpha = 0.4, size = 0.9) +
-  scale_colour_manual(values = c("FALSE" = "#4C8BB5", "TRUE" = "#E07B54"),
-                      labels = c("Regular", "Casewise outlier")) +
-  labs(title = "MacroPCA – Score plot (PC1 vs PC2)",
-       x = "PC 1", y = "PC 2", colour = "") +
-  theme_bw(base_size = 12) +
-  theme(legend.position = "bottom")
+cat("Fitting ICPCA (k =", k, ")...\n")
+fit_icpca <- ICPCA(X, k = k)
 
-print(p_macro_scores)
-ggsave("macropca_scores.pdf", p_macro_scores, width = 6, height = 5)
+cat("ICPCA: Cumulative variance explained:",
+    round(cumsum(fit_icpca$eigenvalues / sum(fit_icpca$eigenvalues))[1:k], 3), "\n")
 
-# --- Outlier map: score distance vs orthogonal distance ---
-# Score distance (SD): distance in the PC subspace
-# Orthogonal distance (OD): distance from the PC subspace
+# =============================================================================
+# 4. Fit MacroPCA
+# =============================================================================
+cat("Fitting MacroPCA (k =", k, ")...\n")
+fit_macro <- MacroPCA(X, k = k, DDCpars = list(silent = TRUE))
 
-SD <- macro_fit$SD   # score distances
-OD <- macro_fit$OD   # orthogonal distances
+cat("MacroPCA: Cumulative variance explained:",
+    round(cumsum(fit_macro$eigenvalues / sum(fit_macro$eigenvalues))[1:k], 3), "\n")
+cat("MacroPCA: Flagged cellwise outliers:",
+    sum(fit_macro$indcells != 0, na.rm = TRUE), "\n")
+cat("MacroPCA: Flagged casewise outliers:",
+    sum(fit_macro$indrows, na.rm = TRUE), "\n\n")
 
-cutoff_SD <- macro_fit$cutoffSD
-cutoff_OD <- macro_fit$cutoffOD
+# =============================================================================
+# 5. Residual maps  (Figure 3)
+#
+# Color scheme (paper):
+#   Yellow   : regular cell (|r_ij| <= sqrt(chi^2_{1,0.99}) = 2.576)
+#   White    : missing value (NA)
+#   Orange-Red: positive outlier (r_ij > 2.576)
+#   Purple-Blue: negative outlier (r_ij < -2.576)
+# Circle on right: OD_i (white = regular, black = large OD)
+# =============================================================================
 
-outlier_type <- case_when(
-  SD > cutoff_SD & OD > cutoff_OD ~ "Both",
-  SD > cutoff_SD                  ~ "Score outlier",
-  OD > cutoff_OD                  ~ "Orthogonal outlier",
-  TRUE                            ~ "Regular"
+# Cars shown in the paper's Figure 3 (24 selected rows including notable ones)
+notable_cars <- c(
+  "Bugatti Veyron", "Pagani Huayra",
+  "BMW i3", "Chevrolet Volt", "Vauxhall Ampera", "Mitsubishi i-MiEV",
+  "Renault Twizy", "Citroen DS5",
+  "Land Rover Defender", "Mercedes-Benz G",
+  "Ssangyong Rodius"
 )
 
-outlier_df <- data.frame(SD, OD, type = outlier_type)
+# Find indices; fall back gracefully if some names differ
+note_idx  <- which(car_names %in% notable_cars)
+# Top OD cars (most outlying by orthogonal distance)
+top_od    <- order(fit_macro$OD, decreasing = TRUE)[1:10]
+# Union, capped at 24 rows
+sel_rows  <- unique(c(note_idx, top_od))[1:min(24, n_distinct(c(note_idx, top_od)))]
+sel_names <- car_names[sel_rows]
 
-p_outlier_map <- ggplot(outlier_df, aes(x = SD, y = OD, colour = type)) +
-  geom_point(alpha = 0.5, size = 0.9) +
-  geom_vline(xintercept = cutoff_SD, linetype = "dashed", colour = "grey40") +
-  geom_hline(yintercept = cutoff_OD, linetype = "dashed", colour = "grey40") +
-  scale_colour_manual(values = c(
-    "Regular"            = "#AAAAAA",
-    "Score outlier"      = "#F0A500",
-    "Orthogonal outlier" = "#4C8BB5",
-    "Both"               = "#E07B54"
-  )) +
-  labs(title    = "MacroPCA – Outlier map",
-       subtitle = "Dashed lines: 97.5% cut-offs",
-       x        = "Score distance (SD)",
-       y        = "Orthogonal distance (OD)",
-       colour   = "Observation type") +
-  theme_bw(base_size = 12) +
-  theme(legend.position = "bottom")
+cat("Selected", length(sel_rows), "cars for residual map.\n")
 
-print(p_outlier_map)
-ggsave("macropca_outlier_map.pdf", p_outlier_map, width = 6, height = 5)
-message("Saved: macropca_outlier_map.pdf")
+# --- MacroPCA residual map ---
+# stdResid is the standardized residual matrix R_{n,d} (paper eq. after Step 6)
+# indcells marks outlying cells
 
-# --- Cellwise outlier heatmap (subset of rows for readability) ---
-# Show the top 50 most outlying rows
-top50 <- order(OD, decreasing = TRUE)[1:50]
-cell_flags <- macro_fit$indcells[top50, ]
+cellMap(
+  d             = fit_macro$stdResid[sel_rows, ],
+  indcells      = fit_macro$indcells[sel_rows, ],
+  rowlabels     = sel_names,
+  columnlabels  = colnames(X),
+  mTitle        = "MacroPCA – Residual map (selected cars)",
+  sizetitlex    = 9,
+  sizetitley    = 8
+)
+# Save to PDF
+pdf("residual_map_macropca.pdf", width = 10, height = 7)
+cellMap(
+  d             = fit_macro$stdResid[sel_rows, ],
+  indcells      = fit_macro$indcells[sel_rows, ],
+  rowlabels     = sel_names,
+  columnlabels  = colnames(X),
+  mTitle        = "MacroPCA – Residual map (Figure 3 right)",
+  sizetitlex    = 9,
+  sizetitley    = 8
+)
+dev.off()
 
-# Convert to data frame for plotting
-cell_df <- as.data.frame(cell_flags)
-cell_df$obs <- seq_len(nrow(cell_df))
-cell_long  <- tidyr::pivot_longer(cell_df, -obs,
-                                  names_to = "variable", values_to = "flag")
+# --- ICPCA residual map ---
+# Construct standardized residuals for ICPCA manually (same color scheme)
+# Predictions from ICPCA
+Xhat_icpca <- sweep(
+  fit_icpca$scores %*% t(fit_icpca$loadings),
+  2, fit_icpca$center, "+"
+)
 
-p_cell_heat <- ggplot(cell_long, aes(x = variable, y = factor(obs), fill = factor(flag))) +
-  geom_tile(colour = "white", linewidth = 0.2) +
-  scale_fill_manual(
-    values = c("0" = "#F5F5F5", "1" = "#E07B54", "-1" = "#4C8BB5"),
-    labels = c("0" = "Normal", "1" = "High outlier", "-1" = "Low outlier"),
-    name   = "Cell status"
-  ) +
-  labs(title    = "Cellwise outlier map (top 50 rows by OD)",
-       subtitle = "MacroPCA / DDC step",
-       x = "Variable", y = "Observation") +
-  theme_bw(base_size = 11) +
-  theme(axis.text.y = element_blank(),
-        axis.ticks.y = element_blank(),
-        legend.position = "bottom")
+# NA-imputed X (replace NAs with ICPCA imputations)
+X_naimputed_icpca <- X
+for (j in seq_len(ncol(X))) {
+  na_j <- is.na(X[, j])
+  X_naimputed_icpca[na_j, j] <- Xhat_icpca[na_j, j]
+}
 
-print(p_cell_heat)
-ggsave("macropca_cellwise_heatmap.pdf", p_cell_heat, width = 7, height = 6)
-message("Saved: macropca_cellwise_heatmap.pdf")
+resid_icpca  <- X_naimputed_icpca - Xhat_icpca
+# Robust column scale (MAD)
+col_mad      <- apply(resid_icpca, 2, function(x) mad(x, na.rm = TRUE))
+col_mad[col_mad < 1e-10] <- 1
+stdR_icpca   <- sweep(resid_icpca, 2, col_mad, "/")
+
+# ICPCA does not flag cells; use threshold ±2.576 as cutoff
+indcells_icpca          <- matrix(0L, nrow(X), ncol(X))
+indcells_icpca[stdR_icpca >  2.576 & !is.na(stdR_icpca)] <-  1L
+indcells_icpca[stdR_icpca < -2.576 & !is.na(stdR_icpca)] <- -1L
+
+pdf("residual_map_icpca.pdf", width = 10, height = 7)
+cellMap(
+  d             = stdR_icpca[sel_rows, ],
+  indcells      = indcells_icpca[sel_rows, ],
+  rowlabels     = sel_names,
+  columnlabels  = colnames(X),
+  mTitle        = "ICPCA – Residual map (Figure 3 left)",
+  sizetitlex    = 9,
+  sizetitley    = 8
+)
+dev.off()
+cat("Saved: residual_map_macropca.pdf and residual_map_icpca.pdf\n")
 
 # =============================================================================
-# 5. Side-by-side comparison of loadings
+# 6. Outlier maps: Score Distance (SD) vs Orthogonal Distance (OD)  (Figure 4)
+#
+# Quadrant classification (paper Section 3):
+#   SD <= cSD, OD <= cOD : Regular
+#   SD >  cSD, OD <= cOD : Good leverage point
+#   SD <= cSD, OD >  cOD : Orthogonal outlier
+#   SD >  cSD, OD >  cOD : Bad leverage point
 # =============================================================================
-loadings_macro <- as.data.frame(macro_fit$loadings[, 1:k])
-colnames(loadings_macro) <- paste0("PC", 1:k)
-loadings_macro$variable <- colnames(X_raw)
-loadings_macro$method   <- "MacroPCA"
 
-loadings_classic2 <- as.data.frame(pca_classic$rotation[, 1:k])
-colnames(loadings_classic2) <- paste0("PC", 1:k)
-loadings_classic2$variable <- colnames(X_raw)
-loadings_classic2$method   <- "Classical PCA"
+make_outlier_map <- function(SD, OD, cSD, cOD, labels, title_str,
+                             label_these = NULL) {
+  type <- case_when(
+    SD > cSD & OD > cOD ~ "Bad leverage point",
+    SD > cSD & OD <= cOD ~ "Good leverage point",
+    SD <= cSD & OD > cOD ~ "Orthogonal outlier",
+    TRUE                 ~ "Regular"
+  )
 
-loadings_combined <- rbind(loadings_macro, loadings_classic2)
-loadings_long2    <- tidyr::pivot_longer(loadings_combined,
-                                         cols      = starts_with("PC"),
-                                         names_to  = "PC",
-                                         values_to = "loading")
+  df <- data.frame(SD, OD, type, label = labels, stringsAsFactors = FALSE)
 
-p_load_compare <- ggplot(
-  loadings_long2[loadings_long2$PC %in% c("PC1", "PC2"), ],
+  # Which cars to label (notable outliers)
+  if (is.null(label_these)) {
+    label_these <- labels[type != "Regular"]
+  }
+  df$show_label <- df$label %in% label_these
+
+  ggplot(df, aes(x = SD, y = OD, colour = type)) +
+    geom_point(aes(shape = type), size = 1.8, alpha = 0.75) +
+    geom_vline(xintercept = cSD, linetype = "dashed", colour = "grey50") +
+    geom_hline(yintercept = cOD, linetype = "dashed", colour = "grey50") +
+    geom_text_repel(
+      data = subset(df, show_label),
+      aes(label = label),
+      size = 2.8, max.overlaps = 20, segment.size = 0.3
+    ) +
+    scale_colour_manual(values = c(
+      "Regular"            = "#AAAAAA",
+      "Good leverage point" = "#4C8BB5",
+      "Orthogonal outlier" = "#E07B54",
+      "Bad leverage point" = "#D62728"
+    )) +
+    scale_shape_manual(values = c(
+      "Regular"            = 1,
+      "Good leverage point" = 2,
+      "Orthogonal outlier" = 16,
+      "Bad leverage point" = 17
+    )) +
+    labs(
+      title    = title_str,
+      x        = "Score distance (SD)",
+      y        = "Orthogonal distance (OD)",
+      colour   = NULL, shape = NULL
+    ) +
+    theme_bw(base_size = 12) +
+    theme(legend.position = "bottom")
+}
+
+# Cars to label on the outlier map (those mentioned in paper Section 3)
+cars_to_label <- c(
+  "BMW i3", "Bugatti Veyron", "Pagani Huayra",
+  "Vauxhall Ampera", "Chevrolet Volt", "Renault Twizy",
+  "Citroen DS5", "Mitsubishi i-MiEV",
+  "Land Rover Defender", "Mercedes-Benz G"
+)
+
+# MacroPCA outlier map
+p_om_macro <- make_outlier_map(
+  SD           = fit_macro$SD,
+  OD           = fit_macro$OD,
+  cSD          = fit_macro$cutoffSD,
+  cOD          = fit_macro$cutoffOD,
+  labels       = car_names,
+  title_str    = "MacroPCA – Outlier map (Figure 4 right)",
+  label_these  = cars_to_label
+)
+
+# ICPCA outlier map
+# Compute SD and OD for ICPCA manually
+# OD: ||◦x_i - x̂_i||
+OD_icpca  <- sqrt(rowSums((X_naimputed_icpca - Xhat_icpca)^2, na.rm = TRUE))
+# SD: robustified Mahalanobis distance in score space (paper eq. 5)
+eig_macro <- fit_macro$eigenvalues   # use MacroPCA eigenvalues as reference
+scores_icpca_SD <- fit_icpca$scores
+SD_icpca <- sqrt(rowSums(
+  sweep(scores_icpca_SD^2, 2, fit_icpca$eigenvalues, "/")
+))
+# Cutoffs using MCD-based approach (approximate with chi-sq quantiles)
+cSD_icpca <- sqrt(qchisq(0.99, df = k))
+cOD_icpca <- fit_icpca$cutoffOD   # use ICPCA's own cutoff if available
+if (is.null(cOD_icpca)) {
+  od23 <- OD_icpca^(2/3)
+  cOD_icpca <- (median(od23) + mad(od23) * qnorm(0.99))^(3/2)
+}
+
+p_om_icpca <- make_outlier_map(
+  SD           = SD_icpca,
+  OD           = OD_icpca,
+  cSD          = cSD_icpca,
+  cOD          = cOD_icpca,
+  labels       = car_names,
+  title_str    = "ICPCA – Outlier map (Figure 4 left)",
+  label_these  = cars_to_label
+)
+
+# Side-by-side panel
+p_outlier_panel <- grid.arrange(p_om_icpca, p_om_macro, ncol = 2)
+ggsave("outlier_map_panel.pdf", p_outlier_panel, width = 14, height = 6)
+cat("Saved: outlier_map_panel.pdf\n")
+
+# =============================================================================
+# 7. Loadings plot  (Figure 11 equivalent for Top Gear)
+# =============================================================================
+load_df <- data.frame(
+  variable = colnames(X),
+  MacroPCA_PC1 = fit_macro$loadings[, 1],
+  MacroPCA_PC2 = fit_macro$loadings[, 2],
+  ICPCA_PC1    = fit_icpca$loadings[, 1],
+  ICPCA_PC2    = fit_icpca$loadings[, 2]
+)
+
+load_long <- load_df %>%
+  pivot_longer(-variable, names_to = "key", values_to = "loading") %>%
+  separate(key, into = c("method", "PC"), sep = "_")
+
+p_loadings <- ggplot(
+  load_long,
   aes(x = variable, y = loading, fill = method)
 ) +
-  geom_bar(stat = "identity", position = "dodge", alpha = 0.85) +
-  scale_fill_manual(values = c("Classical PCA" = "#E07B54", "MacroPCA" = "#4C8BB5")) +
-  facet_wrap(~PC, ncol = 1) +
-  labs(title = "Loadings comparison: Classical PCA vs MacroPCA",
-       x = "Variable", y = "Loading", fill = "Method") +
+  geom_bar(stat = "identity", position = "dodge", alpha = 0.85, width = 0.7) +
+  geom_hline(yintercept = 0, colour = "grey30", linewidth = 0.4) +
+  scale_fill_manual(values = c("MacroPCA" = "#2CA02C", "ICPCA" = "#E07B54")) +
+  facet_wrap(~ PC, ncol = 1) +
+  labs(
+    title = "Loadings: ICPCA vs MacroPCA (Top Gear, k = 2)",
+    x     = NULL, y = "Loading", fill = "Method"
+  ) +
   theme_bw(base_size = 12) +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1),
-        legend.position = "bottom")
+  theme(
+    axis.text.x  = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom"
+  )
 
-print(p_load_compare)
-ggsave("loadings_comparison.pdf", p_load_compare, width = 7, height = 6)
-message("Saved: loadings_comparison.pdf")
+ggsave("loadings_comparison.pdf", p_loadings, width = 8, height = 7)
+cat("Saved: loadings_comparison.pdf\n")
+
+# =============================================================================
+# 8. Online prediction demo  (Section 4 / Figure 5)
+#
+# Exclude the 24 selected cars, fit MacroPCA on the remaining 273 cars,
+# then predict the 24 excluded cars using MacroPCApredict + DDCpredict.
+# Compare residual maps: in-sample (left) vs out-of-sample (right).
+# =============================================================================
+cat("\n=== Online prediction (Section 4 / Figure 5) ===\n")
+
+all_rows   <- seq_len(nrow(X))
+train_rows <- setdiff(all_rows, sel_rows)
+X_train    <- X[train_rows, ]
+X_test     <- X[sel_rows, ]
+
+cat("Training on", length(train_rows), "cars, predicting", length(sel_rows), "\n")
+
+# Fit MacroPCA on training set
+fit_train <- MacroPCA(X_train, k = k, DDCpars = list(silent = TRUE))
+
+# Predict the 24 excluded cars one-by-one using MacroPCApredict
+pred_results <- vector("list", length(sel_rows))
+for (i in seq_along(sel_rows)) {
+  pred_results[[i]] <- tryCatch(
+    MacroPCApredict(
+      Xtrain  = X_train,
+      Xnew    = X_test[i, , drop = FALSE],
+      MacroOut = fit_train
+    ),
+    error = function(e) NULL
+  )
+}
+
+# Build standardized residual matrix for the predicted cars
+# (each MacroPCApredict result has $stdResid)
+stdR_pred <- do.call(rbind, lapply(pred_results, function(r) {
+  if (!is.null(r)) r$stdResid else rep(NA, ncol(X))
+}))
+rownames(stdR_pred) <- sel_names
+
+# Build indcells for predicted cars
+indcells_pred <- do.call(rbind, lapply(pred_results, function(r) {
+  if (!is.null(r)) r$indcells else rep(0L, ncol(X))
+}))
+
+# Side-by-side: in-sample (from fit_macro) vs out-of-sample (from fit_train)
+pdf("online_prediction_comparison.pdf", width = 14, height = 7)
+par(mfrow = c(1, 2))
+
+cellMap(
+  d             = fit_macro$stdResid[sel_rows, ],
+  indcells      = fit_macro$indcells[sel_rows, ],
+  rowlabels     = sel_names,
+  columnlabels  = colnames(X),
+  mTitle        = "In-sample (all 297 cars fitted)",
+  sizetitlex    = 9, sizetitley = 8
+)
+
+cellMap(
+  d             = stdR_pred,
+  indcells      = indcells_pred,
+  rowlabels     = sel_names,
+  columnlabels  = colnames(X),
+  mTitle        = "Out-of-sample (24 cars predicted)",
+  sizetitlex    = 9, sizetitley = 8
+)
+
+dev.off()
+cat("Saved: online_prediction_comparison.pdf\n")
+
+# =============================================================================
+# 9. Summary table of flagged cars
+# =============================================================================
+macro_type <- case_when(
+  fit_macro$SD > fit_macro$cutoffSD & fit_macro$OD > fit_macro$cutoffOD ~
+    "Bad leverage point",
+  fit_macro$SD > fit_macro$cutoffSD ~
+    "Good leverage point",
+  fit_macro$OD > fit_macro$cutoffOD ~
+    "Orthogonal outlier",
+  TRUE ~ "Regular"
+)
+
+flagged_df <- data.frame(
+  Car          = car_names,
+  SD           = round(fit_macro$SD, 2),
+  OD           = round(fit_macro$OD, 2),
+  Type         = macro_type,
+  stringsAsFactors = FALSE
+) %>%
+  filter(Type != "Regular") %>%
+  arrange(desc(OD))
+
+cat("\n=== MacroPCA: Flagged cars (non-regular) ===\n")
+print(flagged_df)
 
 cat("\n=== Real data analysis complete ===\n")
