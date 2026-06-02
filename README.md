@@ -1,6 +1,4 @@
 # MacroPCA — Replication and Extension
-### Mathematics for Machine Learning, Instituto Superior Técnico 2025–2026
-**Authors:** Gil Jorge (110062) · Simão Rego Crispim (ist1110053)
 
 ---
 
